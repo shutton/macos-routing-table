@@ -1,0 +1,11 @@
+[package]
+name = "macos-routing-table"
+version = "0.0.1"
+edition = "2018"
+
+[dependencies]
+anyhow = "1"
+cidr = { version = "0.2", features = [ "serde" ] }
+futures = "0.3"
+mac_address = "1"
+tokio = { version = "1", features = [ "full" ] }
