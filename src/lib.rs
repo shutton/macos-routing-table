@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use cidr::AnyIpCidr;
 use futures::future::BoxFuture;
 use mac_address::MacAddress;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Stdio;
 use std::time::Duration;
@@ -13,29 +13,47 @@ use tokio::process::Command;
 #[derive(Debug)]
 pub struct RoutingTable {
     routes: Vec<RouteEntry>,
+    // Map of interfaces to their default routers
+    if_router: HashMap<String, Vec<IpAddr>>,
+}
+
+/// Internet Protocols
+#[derive(Debug, Clone, Copy)]
+pub enum Protocol {
+    V4,
+    V6,
 }
 
 /// A single route obtained from the `netstat -rn` output
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RouteEntry {
+    /// Protocol
+    pub proto: Protocol,
+
     /// Destination.  E.g., a host or CIDR
-    dest: Entity,
+    pub dest: Entity,
+
     /// Destination's zone qualifer (primarily for IPv6)
-    dest_zone: Option<String>,
+    pub dest_zone: Option<String>,
+
     /// Gateway (i.e., how to reach the destination)
-    gateway: Entity,
+    pub gateway: Entity,
+
     /// Gateway's zone (primarily for IPv6)
-    gw_zone: Option<String>,
+    pub gw_zone: Option<String>,
+
     /// Routing flags
-    flags: HashSet<RoutingFlag>,
+    pub flags: HashSet<RoutingFlag>,
+
     /// Network interface that holds this route
-    net_if: String,
+    pub net_if: String,
+
     /// RouteEntry expiration.  This is primarily seen for ARP-derived entries
-    expires: Option<Duration>,
+    pub expires: Option<Duration>,
 }
 
 /// A generic network entity representing either a destination or gateway
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Entity {
     Default,
     Cidr(AnyIpCidr),
@@ -44,7 +62,7 @@ pub enum Entity {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, std::hash::Hash, Eq, PartialEq)]
+#[derive(Clone, Debug, std::hash::Hash, Eq, PartialEq)]
 pub enum RoutingFlag {
     Proto1,    // 1
     Proto2,    // 2
@@ -101,6 +119,8 @@ impl RoutingTable {
         let mut lines = output.lines();
         let mut headers = vec![];
         let mut routes = vec![];
+        let mut proto = None;
+        let mut if_router = HashMap::new();
 
         while let Some(line) = lines.next() {
             if line.is_empty() || line.starts_with("Routing table") {
@@ -108,6 +128,11 @@ impl RoutingTable {
             }
             match line {
                 section @ ("Internet:" | "Internet6:") => {
+                    proto = match section {
+                        "Internet:" => Some(Protocol::V4),
+                        "Internet6:" => Some(Protocol::V6),
+                        _ => unreachable!(),
+                    };
                     // Next line will contain the column headers
                     if let Some(line) = lines.next() {
                         headers = line.split_ascii_whitespace().collect();
@@ -117,12 +142,25 @@ impl RoutingTable {
                     continue;
                 }
                 entry => {
-                    let route = parse_route(entry, &headers)?;
-                    routes.push(route);
+                    if let Some(proto) = proto {
+                        let route = parse_route(proto, entry, &headers)?;
+                        if let (Entity::Default, Entity::Cidr(cidr)) = (&route.dest, &route.gateway) {
+                            if cidr.is_host_address() {
+                                let route = route.clone();
+                                let gws = if_router.entry(route.net_if).or_insert_with(Vec::new);
+                                gws.push(cidr.first_address().unwrap());
+                            }
+                        }
+                        routes.push(route);
+                    } else {
+                        return Err(anyhow!(
+                            "route entry found before protocol (Internet/Internet6) found."
+                        ));
+                    }
                 }
             };
         }
-        Ok(RoutingTable { routes })
+        Ok(RoutingTable { routes, if_router })
     }
 
     pub fn find_route_entry(&self, addr: IpAddr) -> Option<&RouteEntry> {
@@ -141,6 +179,17 @@ impl RoutingTable {
         self.find_route_entry(addr)
             .map(|route| (&route.gateway, route.net_if.as_str()))
     }
+
+    /// Return the interface that would likely handle packets intended
+    /// for the specified address.
+    pub fn find_gateway_netif(&self, addr: IpAddr) -> Option<&str> {
+        self.find_route_entry(addr)
+            .map(|route| route.net_if.as_str())
+    }
+    
+    pub fn default_gateways_for_netif(&self, net_if: &str) -> Option<&Vec<IpAddr>> {
+        self.if_router.get(net_if)
+    }
 }
 
 impl RouteEntry {
@@ -149,10 +198,10 @@ impl RouteEntry {
         match self.dest {
             Entity::Cidr(cidr) => cidr.contains(&addr),
             Entity::Default => match self.gateway {
-                Entity::Cidr(cidr) => match addr {
-                    IpAddr::V4(_) => cidr.is_ipv4(),
+                Entity::Cidr(_) => match addr {
+                    IpAddr::V4(_) => matches!(self.proto, Protocol::V4),
                     // FIXME: IPv6 should take zone into account
-                    IpAddr::V6(_) => cidr.is_ipv6(),
+                    IpAddr::V6(_) => matches!(self.proto, Protocol::V6),
                 },
                 // These seem unlikely, but assume they're good if found
                 Entity::Link(_) | Entity::Mac(_) => true,
@@ -203,11 +252,8 @@ impl RouteEntry {
     }
 }
 
-fn parse_route(line: &str, headers: &[&str]) -> Result<RouteEntry> {
-    let fields: Vec<String> = line
-        .split_ascii_whitespace()
-        .map(str::to_string)
-        .collect();
+fn parse_route(proto: Protocol, line: &str, headers: &[&str]) -> Result<RouteEntry> {
+    let fields: Vec<String> = line.split_ascii_whitespace().map(str::to_string).collect();
     let mut flags = HashSet::new();
     let mut dest_and_zone: Option<(Entity, Option<String>)> = None;
     let mut gw_and_zone: Option<(Entity, Option<String>)> = None;
@@ -230,6 +276,7 @@ fn parse_route(line: &str, headers: &[&str]) -> Result<RouteEntry> {
     let net_if = net_if.ok_or_else(|| anyhow!("No network interface found"))?;
 
     let route = RouteEntry {
+        proto,
         dest,
         flags,
         gateway,
