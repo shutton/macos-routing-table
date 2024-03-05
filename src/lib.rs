@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use cidr::AnyIpCidr;
 use futures::future::BoxFuture;
 use mac_address::MacAddress;
+use std::borrow::ToOwned;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Stdio;
@@ -106,6 +107,7 @@ async fn query_netstat_routing_table() -> Result<String> {
 impl RoutingTable {
     /// Query the routing table using the `netstat` command.  Returns a future
     /// which must be `await`ed.
+    #[must_use]
     pub fn load_from_netstat() -> BoxFuture<'static, Result<Self>> {
         Box::pin(async move {
             let output = query_netstat_routing_table().await?;
@@ -113,8 +115,12 @@ impl RoutingTable {
         })
     }
 
-    /// Generate a RoutingTable from complete netstat output.  The output should
+    /// Generate a `RoutingTable` from complete netstat output.  The output should
     /// conform to what would be returned from `netstat -rn` on macOS/Darwin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error
     pub fn from_netstat_output(output: &str) -> Result<RoutingTable> {
         let mut lines = output.lines();
         let mut headers = vec![];
@@ -131,7 +137,7 @@ impl RoutingTable {
                     proto = match section {
                         "Internet:" => Some(Protocol::V4),
                         "Internet6:" => Some(Protocol::V6),
-                        _ => unreachable!(),
+                        _ => return Err(anyhow!("Unrecognized section name {proto:?}")),
                     };
                     // Next line will contain the column headers
                     if let Some(line) = lines.next() {
@@ -149,7 +155,9 @@ impl RoutingTable {
                             if cidr.is_host_address() {
                                 let route = route.clone();
                                 let gws = if_router.entry(route.net_if).or_insert_with(Vec::new);
-                                gws.push(cidr.first_address().unwrap());
+                                gws.push(cidr.first_address().ok_or_else(|| {
+                                    anyhow!("CIDR first address neither V4 nor V6")
+                                })?);
                             }
                         }
                         routes.push(route);
@@ -164,6 +172,7 @@ impl RoutingTable {
         Ok(RoutingTable { routes, if_router })
     }
 
+    #[must_use]
     pub fn find_route_entry(&self, addr: IpAddr) -> Option<&RouteEntry> {
         self.routes
             .iter()
@@ -176,6 +185,7 @@ impl RoutingTable {
 
     /// Return the gateway and interface that would likely handle packets intended
     /// for the specified address.
+    #[must_use]
     pub fn find_gateway(&self, addr: IpAddr) -> Option<(&Entity, &str)> {
         self.find_route_entry(addr)
             .map(|route| (&route.gateway, route.net_if.as_str()))
@@ -183,11 +193,13 @@ impl RoutingTable {
 
     /// Return the interface that would likely handle packets intended
     /// for the specified address.
+    #[must_use]
     pub fn find_gateway_netif(&self, addr: IpAddr) -> Option<&str> {
         self.find_route_entry(addr)
             .map(|route| route.net_if.as_str())
     }
 
+    #[must_use]
     pub fn default_gateways_for_netif(&self, net_if: &str) -> Option<&Vec<IpAddr>> {
         self.if_router.get(net_if)
     }
@@ -207,7 +219,7 @@ impl RouteEntry {
                 // These seem unlikely, but assume they're good if found
                 Entity::Link(_) | Entity::Mac(_) => true,
                 // Anything else is probably bad
-                _ => false,
+                Entity::Default => false,
             },
             _ => false,
         }
@@ -279,11 +291,11 @@ fn parse_route(proto: Protocol, line: &str, headers: &[&str]) -> Result<RouteEnt
     let route = RouteEntry {
         proto,
         dest,
-        flags,
-        gateway,
-        net_if,
         dest_zone,
+        gateway,
         gw_zone,
+        flags,
+        net_if,
         expires,
     };
     Ok(route)
@@ -299,11 +311,11 @@ fn parse_destination(dest: &str) -> Result<(Entity, Option<String>)> {
         let (addr, zone_etc) = dest.split_at(pos);
         let addr: AnyIpCidr = addr.parse()?;
         let mut zone_etc = zone_etc.split('/');
-        let zone = zone_etc.next().map(|s| s.to_owned());
+        let zone = zone_etc.next().map(ToOwned::to_owned);
 
         if let Some(bits) = zone_etc.next() {
             // Just reassemble it without the %zone and run it through the regular parser
-            let s = format!("{}{}", addr, bits);
+            let s = format!("{addr}{bits}");
             (parse_simple_destination(&s)?, zone)
         } else {
             (Entity::Cidr(addr), zone)
@@ -346,7 +358,7 @@ fn parse_ipv4dest(dest: &str) -> Result<Ipv4Addr> {
         .or_else(|_| {
             let parts: Vec<u8> = dest
                 .split('.')
-                .map(|s| s.parse::<u8>())
+                .map(str::parse)
                 .collect::<std::result::Result<Vec<u8>, std::num::ParseIntError>>()?;
             // This bizarre byte-ordering comes from inet_addr(3)
             match parts.len() {
