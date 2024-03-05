@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use cidr::AnyIpCidr;
 use futures::future::BoxFuture;
 use mac_address::MacAddress;
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Stdio;
 use std::time::Duration;
@@ -144,7 +144,8 @@ impl RoutingTable {
                 entry => {
                     if let Some(proto) = proto {
                         let route = parse_route(proto, entry, &headers)?;
-                        if let (Entity::Default, Entity::Cidr(cidr)) = (&route.dest, &route.gateway) {
+                        if let (Entity::Default, Entity::Cidr(cidr)) = (&route.dest, &route.gateway)
+                        {
                             if cidr.is_host_address() {
                                 let route = route.clone();
                                 let gws = if_router.entry(route.net_if).or_insert_with(Vec::new);
@@ -186,7 +187,7 @@ impl RoutingTable {
         self.find_route_entry(addr)
             .map(|route| route.net_if.as_str())
     }
-    
+
     pub fn default_gateways_for_netif(&self, net_if: &str) -> Option<&Vec<IpAddr>> {
         self.if_router.get(net_if)
     }
@@ -319,7 +320,12 @@ fn parse_simple_destination(dest: &str) -> Result<Entity> {
         cidr if cidr.contains('/') => Entity::Cidr(cidr.parse()?),
         // IPv4 host
         addr if addr.contains('.') => {
-            Entity::Cidr(AnyIpCidr::new_host(IpAddr::V4(parse_ipv4dest(addr)?)))
+            if let Ok(ipv4addr) = parse_ipv4dest(addr) {
+                Entity::Cidr(AnyIpCidr::new_host(IpAddr::V4(ipv4addr)))
+            } else {
+                // Bridge broadcast addresses sometimes contain a dot-delimited MAC address
+                Entity::Mac(addr.replace('.', ":").parse::<MacAddress>()?)
+            }
         }
         // IPv6 host
         addr if addr.contains(':') => {
