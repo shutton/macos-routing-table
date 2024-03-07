@@ -41,7 +41,7 @@ impl RoutingTable {
     /// Returns an error if the `netstat` command fails to execute, or returns
     /// unparseable output.
     pub async fn load_from_netstat() -> Result<Self, Error> {
-        let output = query_netstat_routing_table().await?;
+        let output = execute_netstat().await?;
         Self::from_netstat_output(&output)
     }
 
@@ -122,7 +122,8 @@ impl RoutingTable {
     }
 }
 
-async fn query_netstat_routing_table() -> Result<String, Error> {
+/// Execute `netstat -rn` and return the output
+pub async fn execute_netstat() -> Result<String, Error> {
     let output = Command::new(NETSTAT_PATH)
         .arg("-rn")
         .stdin(std::process::Stdio::null())
