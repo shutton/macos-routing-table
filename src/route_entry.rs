@@ -29,6 +29,21 @@ pub struct RouteEntry {
     pub expires: Option<Duration>,
 }
 
+impl std::fmt::Display for RouteEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        #[allow(unused_variables)]
+        let RouteEntry {
+            proto,
+            dest,
+            gateway,
+            flags,
+            net_if,
+            expires,
+        } = self;
+        write!(f, "{proto:?}({dest} -> {gateway} if={net_if}")
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("parsing destination CIDR {value:?}: {err}")]
@@ -112,10 +127,8 @@ impl RouteEntry {
                     // FIXME: IPv6 should take zone into account
                     IpAddr::V6(_) => matches!(self.proto, Protocol::V6),
                 },
-                // These seem unlikely, but assume they're good if found
-                Entity::Link(_) | Entity::Mac(_) => true,
-                // Anything else is probably bad
-                Entity::Default => false,
+                // Ignore these -- they never "contain" any IpAddr
+                Entity::Link(_) | Entity::Mac(_) | Entity::Default => false,
             },
             _ => false,
         }
@@ -126,7 +139,8 @@ impl RouteEntry {
     /// length
     pub(crate) fn most_precise<'a>(&'a self, other: &'a Self) -> &'a Self {
         match self.dest.entity {
-            // If this is a hardware address, we already know it's on the same local network, and it's in the ARP table
+            // If this is a hardware address, we already know it's on the same
+            // local network, and it's in the ARP table
             Entity::Mac(_) => self,
             Entity::Link(_) => match other.dest.entity {
                 // The other specifies a hardware address -- it's better
@@ -137,23 +151,27 @@ impl RouteEntry {
             Entity::Cidr(cidr) => match other.dest.entity {
                 Entity::Mac(_) | Entity::Link(_) => other,
                 Entity::Cidr(other_cidr) => {
-                    if let Some(cidr_nl) = cidr.network_length() {
-                        if let Some(other_nl) = other_cidr.network_length() {
-                            if cidr_nl >= other_nl {
-                                self
-                            } else {
-                                other
-                            }
-                        } else {
-                            panic!("Can't compare gateway CIDR of 'Any' type");
-                        }
+                    let Some(cidr_nl) = cidr.network_length() else {
+                        // Can't compare gateway CIDR of 'Any' type
+                        return other;
+                    };
+
+                    let Some(other_nl) = other_cidr.network_length() else {
+                        // Can't compare gateway CIDR of 'Any' type
+                        return self;
+                    };
+
+                    // Choose the one with the longest network length
+                    if cidr_nl >= other_nl {
+                        self
                     } else {
-                        panic!("Can't complare gateway CIDR of 'Any' type");
+                        other
                     }
                 }
                 Entity::Default => self,
             },
             Entity::Default => match other.dest.entity {
+                // Never prefer a default route
                 Entity::Default => self,
                 _ => other,
             },
@@ -168,10 +186,9 @@ fn parse_destination(dest: &str) -> Result<Destination, Error> {
             zone: None,
         });
     }
-    Ok(if let Some(pos) = dest.find('%') {
+    Ok(if let Some((addr, zone_etc)) = dest.split_once('%') {
         // This route contains a zone ID
         // See: https://superuser.com/questions/99746/why-is-there-a-percent-sign-in-the-ipv6-address
-        let (addr, zone_etc) = dest.split_at(pos);
         let addr: AnyIpCidr = addr.parse().map_err(|err| Error::ParseDestination {
             value: addr.into(),
             err,
