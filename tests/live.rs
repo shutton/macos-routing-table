@@ -1,4 +1,4 @@
-#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::missing_panics_doc, clippy::missing_errors_doc)]
 
 use anyhow::Result;
 use macos_routing_table::{execute_netstat, RoutingTable};
